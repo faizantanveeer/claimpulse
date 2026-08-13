@@ -1,0 +1,9 @@
+dbt-core
+dbt-snowflake
+snowflake-connector-python
+snowflake-snowpark-python
+boto3
+faker
+python-dotenv
+pandas
+requests
