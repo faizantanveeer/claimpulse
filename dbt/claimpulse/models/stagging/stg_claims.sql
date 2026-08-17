@@ -9,14 +9,14 @@ with source as (
 ),
 
 providers as (
-    select provider_id, canonical_provider_id from {{ ref('stg_providers') }}
+    select provider_id, resolved_provider_id from {{ ref('stg_providers') }}
 )
 
 select
     source.claim_id,
     source.carrier_id,
     source.provider_id,
-    providers.canonical_provider_id as resolved_provider_id,
+    providers.resolved_provider_id,
     try_to_date(source.date_of_loss, 'YYYY-MM-DD') as date_of_loss,
     try_to_date(source.claim_open_date, 'YYYY-MM-DD') as claim_open_date,
     source.claim_status,

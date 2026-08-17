@@ -10,7 +10,7 @@ models:
 
   - name: stg_providers
     description: >
-      One row per raw provider record. canonical_provider_id resolves
+      One row per raw provider record. resolved_provider_id resolves
       typo'd duplicates to a single identity -- join on that column,
       not provider_id, for anything downstream that counts providers.
     columns:
@@ -18,7 +18,7 @@ models:
         tests:
           - unique
           - not_null
-      - name: canonical_provider_id
+      - name: resolved_provider_id
         tests:
           - not_null
 

@@ -26,14 +26,14 @@ canonical as (
         *,
         min(provider_id) over (
             partition by normalized_name, state
-        ) as canonical_provider_id
+        ) as resolved_provider_id
     from cleaned
 )
 
 select
     provider_id,
-    canonical_provider_id,
-    (provider_id != canonical_provider_id) as is_duplicate,
+    resolved_provider_id,
+    (provider_id != resolved_provider_id) as is_duplicate,
     original_provider_name as provider_name,
     coalesce(specialty, 'unknown') as specialty,
     (specialty is null) as specialty_was_missing,
