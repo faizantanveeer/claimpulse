@@ -20,7 +20,10 @@ models:
   claimpulse:
     stagging:
       +materialized: view
+      +schema: stagging 
     intermediate:
       +materialized: view
+      +schema: intermediate 
     marts:
       +materialized: table
+      +schema: marts 

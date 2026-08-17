@@ -19,6 +19,7 @@ SELECT
         completed_date,
         'YYYY-MM-DD'
     ) AS completed_date,
+    status,
     _loaded_at
 FROM
     source
