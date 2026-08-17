@@ -1,0 +1,17 @@
+version: 2
+
+sources:
+  - name: raw_claims
+    database: claimpulse_raw
+    schema: raw_claims
+    description: >
+      Immutable raw tables loaded by load_to_snowflake.py via scheduled
+      COPY INTO. Every column is loaded as STRING -- no casting or
+      cleaning happens here (see ARCHITECTURE.md section 7). Staging
+      models are the first place any interpretation of the data occurs.
+    tables:
+      - name: carriers
+      - name: providers
+      - name: claims
+      - name: carrier_letters
+      - name: training_records

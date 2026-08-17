@@ -105,7 +105,7 @@ claimspulse-claim-processing/
 ## 5. Snowflake account structure
 
 - **RAW database** (`claimpulse_raw.raw_claims`) → loaded via scheduled `COPY INTO`, not Snowpipe (decision: keep a single scheduler — Airflow — rather than running Snowflake's own TASK scheduler alongside it; Snowpipe is a documented future upgrade once event-driven ingestion is needed). Every column is loaded as `STRING`, even dates — RAW does no casting or interpretation, that's staging's job (see section 7).
-- **ANALYTICS database** (`claimpulse_analytics`) → three schemas built entirely by dbt: `staging`, `intermediate`, `marts`.
+- **ANALYTICS database** (`claimpulse_analytics`) → three schemas built entirely by dbt: `staging`, `intermediate`, `marts`. **Note**: dbt's default behavior concatenates the profile's default schema with any model-level `+schema` config, which produced the literal schema `staging_staging` on the first build — cosmetic only, no impact on data or test correctness, and left as-is by choice rather than fixed with a schema-naming macro.
 - **Warehouse**: `claimpulse_wh`, XS, `AUTO_SUSPEND = 60`, `AUTO_RESUME = TRUE`, `INITIALLY_SUSPENDED = TRUE`.
 - **Resource monitor**: hard credit quota of 50 (well under the $400/30-day trial), notifies at 75%, suspends the warehouse outright at 100% — protects against a runaway query or a forgotten idle warehouse draining the trial early.
 - **Roles**: `claimpulse_loader` (INSERT/SELECT on RAW only — used by the `COPY INTO` step) and `claimpulse_transformer` (SELECT on RAW, full control of ANALYTICS — used by dbt). Neither runs as `ACCOUNTADMIN`.
@@ -117,9 +117,12 @@ claimspulse-claim-processing/
 ```
 models/
   staging/
-    stg_claims.sql
-    stg_carrier_letters.sql
-    stg_providers.sql
+    _sources.yml           raw table definitions
+    _staging.yml            tests: not_null, unique, relationships, dbt_expectations
+    stg_carriers.sql
+    stg_providers.sql       resolves duplicate identities -> canonical_provider_id
+    stg_claims.sql          casts dates, resolves provider match against full provider_id set
+    stg_carrier_letters.sql coalesces null status, flags date anomalies
     stg_training_records.sql
   intermediate/
     int_claims_with_sla_flags.sql
@@ -129,14 +132,15 @@ models/
     fct_carrier_letters.sql
     dim_provider.sql
     dim_carrier.sql
-tests/
-  (schema tests via YAML: not_null, unique, relationships,
-   dbt_utils.accepted_range, dbt_expectations for business rules
-   e.g. response_due_date must be after received_date)
 macros/
-  days_between.sql
-  sla_breach_flag.sql
+  normalize_text.sql          whitespace/casing normalization, used in dedup
 ```
+
+**Key modeling decision, learned by hitting it:** referential integrity checking and identity resolution are two separate concerns that must not be conflated.
+- **Referential integrity** ("does this ID exist at all?") is tested against the full, raw `provider_id` column on `stg_providers` — every row, duplicates included.
+- **Identity resolution** ("which canonical entity does this row actually belong to?") uses `canonical_provider_id` — collapsed across duplicates.
+
+The first build mistakenly tested claims/training relationships against `canonical_provider_id` instead of `provider_id`, which made every claim referencing one of the 8 known-duplicate raw IDs look like a false orphan (112 warnings instead of the true ~30). Once the relationship tests and the `stg_claims` join were both pointed at `provider_id` for existence-checking — reserving `canonical_provider_id` purely for later grouping/aggregation in intermediate and marts — the counts matched the injected data exactly (27 date anomalies, 30 orphaned claims, 0 orphaned training records).
 
 ## 7. Data quality resolution strategy
 
@@ -151,7 +155,7 @@ Raw data is never touched or corrected in place. Nothing is silently dropped, fi
 
 | Issue | Caught where | Mechanism | Resolved how | Severity |
 |---|---|---|---|---|
-| Claim points to a `provider_id` that doesn't exist | `stg_claims` | dbt `relationships` test | Left join keeps the claim, adds `provider_match_status = 'unmatched'`. Still tracked for SLA purposes in `int_claims_with_sla_flags`, plus a `needs_provider_review` flag for a human. Never dropped — a broken provider link doesn't erase a real deadline. | warn |
+| Claim points to a `provider_id` that doesn't exist | `stg_claims` | dbt `relationships` test against `stg_providers.provider_id` (the full raw ID set — not `canonical_provider_id`, which only contains post-dedup identities) | Left join on raw `provider_id` keeps the claim, adds `provider_match_status = 'unmatched'` plus `resolved_provider_id` (the canonical ID, for later grouping). Still tracked for SLA purposes in `int_claims_with_sla_flags`, plus a `needs_provider_review` flag for a human. Never dropped — a broken provider link doesn't erase a real deadline. | warn |
 | Letter missing `classification_status` | `stg_carrier_letters` | `not_null` test | Coalesced to `'unclassified'` (never guessed). Business rule in `int_claims_with_sla_flags`: unclassified is treated as **unresolved** — the conservative assumption. | warn |
 | `response_due_date` before `received_date` | `stg_carrier_letters` | `dbt_expectations.expect_column_pair_values_A_to_be_greater_than_B` | Flagged `is_date_anomaly = true`, excluded from SLA breach calculation (can't compute a deadline breach off a broken deadline), but kept and surfaced on a data-quality mart page — never silently dropped. | error |
 | Duplicate provider (typo'd name, different ID) | `stg_providers` | No automated test — fuzzy duplicates are a modeling problem, not a null/type problem | Dedup macro: normalize whitespace/casing, group by `(normalized_name, state)`, pick earliest `provider_id` as canonical, emit a `provider_id_map` so future duplicates route to the canonical ID. The one case where staging rewrites a value, because it's resolving identity, not fixing data. | n/a (structural) |

@@ -16,13 +16,13 @@ import logging
 import os
 import sys
 
-from dotenv import load_dotenv
 import snowflake.connector
+
+from dotenv import load_dotenv
+load_dotenv() 
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(levelname)s  %(message)s")
 log = logging.getLogger("claimpulse-loader")
-
-load_dotenv()
 
 SNOWFLAKE_ACCOUNT = os.environ.get("SNOWFLAKE_ACCOUNT")
 SNOWFLAKE_USER = os.environ.get("SNOWFLAKE_USER")
@@ -34,6 +34,20 @@ SNOWFLAKE_SCHEMA = "raw_claims"
 STAGE_NAME = "claimpulse_raw_stage"
 
 TABLES = ["carriers", "providers", "claims", "carrier_letters", "training_records"]
+
+# Explicit column order matching each CSV exactly, since a transformation-based
+# COPY INTO (needed to populate _loaded_at / _source_file) addresses source
+# columns positionally ($1, $2, ...) rather than by name.
+TABLE_COLUMNS = {
+    "carriers": ["carrier_id", "carrier_name", "tpa_flag"],
+    "providers": ["provider_id", "provider_name", "specialty", "state"],
+    "claims": ["claim_id", "provider_id", "carrier_id", "date_of_loss",
+               "claim_open_date", "claim_status", "state"],
+    "carrier_letters": ["letter_id", "claim_id", "carrier_id", "letter_type",
+                        "received_date", "response_due_date", "classification_status"],
+    "training_records": ["training_id", "provider_id", "carrier_id",
+                          "assigned_date", "completed_date", "status"],
+}
 
 
 def get_connection():
@@ -55,17 +69,24 @@ def get_connection():
 
 def copy_into_table(cursor, table_name: str):
     stage_path = f"@{STAGE_NAME}/source=batch/table={table_name}/"
+    source_columns = TABLE_COLUMNS[table_name]
+    target_columns = source_columns + ["_loaded_at", "_source_file"]
+
+    # Positional $1, $2, ... refs matching source_columns order exactly,
+    # plus CURRENT_TIMESTAMP() and METADATA$FILENAME for the two audit
+    # columns COPY INTO would otherwise silently leave NULL -- MATCH_BY_
+    # COLUMN_NAME only maps columns present in the file, and does NOT fall
+    # back to a column's DEFAULT for anything missing; it inserts NULL.
+    positional_refs = ", ".join(f"${i+1}" for i in range(len(source_columns)))
+
     query = f"""
-        COPY INTO {table_name}
-        FROM {stage_path}
-        FILE_FORMAT = (FORMAT_NAME = 'csv_standard')
-        MATCH_BY_COLUMN_NAME = CASE_INSENSITIVE
+        COPY INTO {table_name} ({", ".join(target_columns)})
+        FROM (
+            SELECT {positional_refs}, CURRENT_TIMESTAMP(), METADATA$FILENAME
+            FROM {stage_path} (FILE_FORMAT => 'csv_standard')
+        )
         ON_ERROR = 'CONTINUE'
     """
-    # ON_ERROR = CONTINUE: a single malformed row doesn't abort the whole
-    # file. Rejected rows show up in COPY INTO's result set below, which we
-    # log rather than silently swallow -- consistent with the "never hide
-    # a data problem" principle from ARCHITECTURE.md section 7.
     log.info(f"Loading {table_name} from {stage_path}")
     cursor.execute(query)
     results = cursor.fetchall()
@@ -80,11 +101,6 @@ def copy_into_table(cursor, table_name: str):
         log.info(f"  {row_dict.get('file')}: status={row_dict.get('status')}, "
                  f"rows_loaded={row_dict.get('rows_loaded')}, "
                  f"errors={row_dict.get('errors_seen')}")
-        if row_dict.get("errors_seen"):
-            log.warning(f"    first_error={row_dict.get('first_error')} "
-                        f"(line {row_dict.get('first_error_line')}, "
-                        f"col {row_dict.get('first_error_column_name')}, "
-                        f"char {row_dict.get('first_error_character')})")
 
     log.info(f"  {table_name} totals: {total_rows_loaded} rows loaded, "
              f"{total_rows_errored} rows errored")

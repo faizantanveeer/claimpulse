@@ -1,0 +1,91 @@
+version: 2
+
+models:
+  - name: stg_carriers
+    columns:
+      - name: carrier_id
+        tests:
+          - unique
+          - not_null
+
+  - name: stg_providers
+    description: >
+      One row per raw provider record. canonical_provider_id resolves
+      typo'd duplicates to a single identity -- join on that column,
+      not provider_id, for anything downstream that counts providers.
+    columns:
+      - name: provider_id
+        tests:
+          - unique
+          - not_null
+      - name: canonical_provider_id
+        tests:
+          - not_null
+
+  - name: stg_claims
+    columns:
+      - name: claim_id
+        tests:
+          - unique
+          - not_null
+      - name: provider_id
+        tests:
+          - relationships:
+              arguments:
+                to: ref('stg_providers')
+                field: provider_id   # checks the raw ID exists at all -- true
+                                     # orphans only, distinct from identity dedup
+              config:
+                severity: warn   # orphaned provider -- flagged, never blocks the run
+      - name: carrier_id
+        tests:
+          - relationships:
+              arguments:
+                to: ref('stg_carriers')
+                field: carrier_id
+              config:
+                severity: warn
+
+  - name: stg_carrier_letters
+    columns:
+      - name: letter_id
+        tests:
+          - unique
+          - not_null
+      - name: classification_status
+        tests:
+          - not_null   # guaranteed by the coalesce -- this test should never fail;
+                        # if it does, the coalesce logic itself broke
+      - name: claim_id
+        tests:
+          - relationships:
+              arguments:
+                to: ref('stg_claims')
+                field: claim_id
+              config:
+                severity: warn
+    tests:
+      - dbt_expectations.expect_column_pair_values_A_to_be_greater_than_B:
+          arguments:
+            column_A: response_due_date
+            column_B: received_date
+            or_equal: true
+            row_condition: "response_due_date is not null and received_date is not null"
+          config:
+            severity: error   # a genuinely broken date is a real defect, not a business
+                               # judgment call -- this should block promotion
+
+  - name: stg_training_records
+    columns:
+      - name: training_id
+        tests:
+          - unique
+          - not_null
+      - name: provider_id
+        tests:
+          - relationships:
+              arguments:
+                to: ref('stg_providers')
+                field: provider_id
+              config:
+                severity: warn
