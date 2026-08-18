@@ -7,3 +7,4 @@ faker
 python-dotenv
 pandas
 requests
+apache-airflow

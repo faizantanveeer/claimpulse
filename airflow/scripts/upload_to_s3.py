@@ -46,7 +46,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(levelname)s  %(me
 log = logging.getLogger("claimpulse-uploader")
 
 BUCKET_NAME = "claimspulse-claim-processing"
-LOCAL_OUTPUT_DIR = Path(__file__).parent / "output"
+OUTPUT_DIR = Path(os.environ.get("CLAIMPULSE_DATA_DIR", Path(__file__).parent / "output"))
 EXPECTED_COLUMNS = {
     "carriers": {"carrier_id", "carrier_name", "tpa_flag"},
     "providers": {"provider_id", "provider_name", "specialty", "state"},
@@ -164,11 +164,11 @@ def process_table(table_name: str, local_dir: Path, source: str = "batch"):
 
 
 def main():
-    if not LOCAL_OUTPUT_DIR.exists():
-        log.error(f"No output directory found at {LOCAL_OUTPUT_DIR}. Run generate_data.py first.")
+    if not OUTPUT_DIR.exists():
+        log.error(f"No output directory found at {OUTPUT_DIR}. Run generate_data.py first.")
         sys.exit(1)
 
-    for table_dir in sorted(LOCAL_OUTPUT_DIR.iterdir()):
+    for table_dir in sorted(OUTPUT_DIR.iterdir()):
         if not table_dir.is_dir():
             continue
         table_name = table_dir.name

@@ -105,7 +105,7 @@ claimspulse-claim-processing/
 ## 5. Snowflake account structure
 
 - **RAW database** (`claimpulse_raw.raw_claims`) → loaded via scheduled `COPY INTO`, not Snowpipe (decision: keep a single scheduler — Airflow — rather than running Snowflake's own TASK scheduler alongside it; Snowpipe is a documented future upgrade once event-driven ingestion is needed). Every column is loaded as `STRING`, even dates — RAW does no casting or interpretation, that's staging's job (see section 7).
-- **ANALYTICS database** (`claimpulse_analytics`) → three schemas built entirely by dbt: `staging`, `intermediate`, `marts`. **Note**: dbt's default behavior concatenates the profile's default schema with any model-level `+schema` config, which produced the literal schema `staging_staging` on the first build — cosmetic only, no impact on data or test correctness, and left as-is by choice rather than fixed with a schema-naming macro.
+- **ANALYTICS database** (`claimpulse_analytics`) → three schemas built entirely by dbt: `staging`, `intermediate`, `marts`. **Note**: dbt's default behavior concatenates the profile's default schema with any model-level `+schema` config, which produced the literal schema `staging_staging` on the first build. Initially left as-is by choice (cosmetic only). Once separate `intermediate`/`marts` schemas became a real day-to-day need, a `generate_schema_name.sql` macro override was added — this makes any model-level `+schema` config authoritative on its own, with no concatenation. This fixes schema naming project-wide, not just for `intermediate`/`marts`: staging models (which have no `+schema` config) now correctly fall back to the plain profile default schema too. The old `staging_staging` schema is an orphaned leftover from before the macro existed and can be dropped (`DROP SCHEMA IF EXISTS claimpulse_analytics.staging_staging;`).
 - **Warehouse**: `claimpulse_wh`, XS, `AUTO_SUSPEND = 60`, `AUTO_RESUME = TRUE`, `INITIALLY_SUSPENDED = TRUE`.
 - **Resource monitor**: hard credit quota of 50 (well under the $400/30-day trial), notifies at 75%, suspends the warehouse outright at 100% — protects against a runaway query or a forgotten idle warehouse draining the trial early.
 - **Roles**: `claimpulse_loader` (INSERT/SELECT on RAW only — used by the `COPY INTO` step) and `claimpulse_transformer` (SELECT on RAW, full control of ANALYTICS — used by dbt). Neither runs as `ACCOUNTADMIN`.
@@ -120,27 +120,37 @@ models/
     _sources.yml           raw table definitions
     _staging.yml            tests: not_null, unique, relationships, dbt_expectations
     stg_carriers.sql
-    stg_providers.sql       resolves duplicate identities -> canonical_provider_id
+    stg_providers.sql       resolves duplicate identities -> resolved_provider_id
     stg_claims.sql          casts dates, resolves provider match against full provider_id set
     stg_carrier_letters.sql coalesces null status, flags date anomalies
-    stg_training_records.sql
+    stg_training_records.sql joins to stg_providers on raw provider_id for resolved_provider_id
   intermediate/
-    int_claims_with_sla_flags.sql
-    int_provider_training_status.sql
+    int_carrier_letters_with_sla_flags.sql   letter-grain SLA breach logic
+    int_provider_training_status.sql         training lapse + anomaly logic
+    int_claims_enriched.sql                  claims + letter flags, pre-aggregation
   marts/
-    fct_claims.sql
-    fct_carrier_letters.sql
-    dim_provider.sql
-    dim_carrier.sql
-macros/
-  normalize_text.sql          whitespace/casing normalization, used in dedup
+    dim_carriers.sql
+    dim_providers.sql        one row per resolved_provider_id (dedup filter applied)
+    fct_carrier_letters.sql  letter grain, joins in resolved_provider_id from stg_claims
+    fct_provider_training.sql
+    fct_claims.sql            claim grain, aggregated up from int_claims_enriched
+  macros/
+    normalize_text.sql       whitespace/casing normalization, used in dedup
 ```
 
-**Key modeling decision, learned by hitting it:** referential integrity checking and identity resolution are two separate concerns that must not be conflated.
-- **Referential integrity** ("does this ID exist at all?") is tested against the full, raw `provider_id` column on `stg_providers` — every row, duplicates included.
-- **Identity resolution** ("which canonical entity does this row actually belong to?") uses `canonical_provider_id` — collapsed across duplicates.
+**Naming correction:** the letters model was originally named `int_claims_with_sla_flags`, which was misleading — its actual grain is one row per *letter*, not per claim (a claim can have 0-3 letters). Renamed to `int_carrier_letters_with_sla_flags` to match its real grain. This was a spec mistake made early on, not a bug in the model itself — the logic was always correctly letter-grained.
 
-The first build mistakenly tested claims/training relationships against `canonical_provider_id` instead of `provider_id`, which made every claim referencing one of the 8 known-duplicate raw IDs look like a false orphan (112 warnings instead of the true ~30). Once the relationship tests and the `stg_claims` join were both pointed at `provider_id` for existence-checking — reserving `canonical_provider_id` purely for later grouping/aggregation in intermediate and marts — the counts matched the injected data exactly (27 date anomalies, 30 orphaned claims, 0 orphaned training records).
+**Column rename:** `stg_providers.canonical_provider_id` was renamed to `resolved_provider_id` partway through the build. This rippled into every model referencing it (`dim_providers`, the `_staging.yml` tests, `stg_claims`, `stg_training_records`) and required updating each one individually — a concrete lesson in why renaming a shared column is never a one-file change.
+
+**Fifth mart added mid-build:** the original plan had 4 marts (`fct_claims`, `fct_carrier_letters`, `dim_provider`, `dim_carrier`). `fct_provider_training` was added once it became clear that training-lapse tracking is a genuinely separate business event from letter SLA tracking — different grain, different frequency — and folding it into `fct_carrier_letters` would have caused a fact-to-fact fan-out (duplicated rows) rather than a clean star-schema join through the shared provider dimension.
+
+**Key modeling decision, learned by hitting it twice:** referential integrity checking and identity resolution are two separate concerns that must not be conflated.
+- **Referential integrity** ("does this ID exist at all?") is tested against the full, raw `provider_id` column on `stg_providers` — every row, duplicates included.
+- **Identity resolution** ("which resolved entity does this row actually belong to?") uses `resolved_provider_id` — collapsed across duplicates.
+
+This bug was hit twice in the same build: first in `stg_claims` (relationship tests and the join both mistakenly pointed at the canonical/resolved column instead of the raw one, inflating orphan warnings from ~30 to 112), then again in `stg_training_records` after the `resolved_provider_id` column was added there — joining `source.provider_id = providers.resolved_provider_id` caused a fan-out (one training record matching multiple provider rows in a duplicate group), which surfaced as a failing `unique` test on `training_id`. Both times, the fix was the same: join/test against the raw `provider_id` column (guaranteed unique) for existence-checking, and reserve `resolved_provider_id` purely for later grouping/aggregation in intermediate and marts. Final verified counts: 27 date anomalies, 30 orphaned claims, 0 orphaned training records, 0 duplicate `training_id`s.
+
+**`dbt run` vs `dbt test`:** `dbt build` treats an `error`-severity test failure as a hard stop for anything downstream in the dependency graph. Since the date-anomaly test on `stg_carrier_letters` is `error` severity and permanently fails on the same 27 synthetic rows every run, `dbt build` alone would perpetually skip `int_carrier_letters_with_sla_flags` and `fct_carrier_letters`. Resolved by splitting `dbt run` (builds every model regardless of test outcome) from `dbt test` (reports pass/warn/fail independently) — the pattern Airflow will use directly: run always builds the marts, test results decide whether to alert on data quality, without ever silently freezing part of the model layer.
 
 ## 7. Data quality resolution strategy
 
@@ -155,10 +165,13 @@ Raw data is never touched or corrected in place. Nothing is silently dropped, fi
 
 | Issue | Caught where | Mechanism | Resolved how | Severity |
 |---|---|---|---|---|
-| Claim points to a `provider_id` that doesn't exist | `stg_claims` | dbt `relationships` test against `stg_providers.provider_id` (the full raw ID set — not `canonical_provider_id`, which only contains post-dedup identities) | Left join on raw `provider_id` keeps the claim, adds `provider_match_status = 'unmatched'` plus `resolved_provider_id` (the canonical ID, for later grouping). Still tracked for SLA purposes in `int_claims_with_sla_flags`, plus a `needs_provider_review` flag for a human. Never dropped — a broken provider link doesn't erase a real deadline. | warn |
-| Letter missing `classification_status` | `stg_carrier_letters` | `not_null` test | Coalesced to `'unclassified'` (never guessed). Business rule in `int_claims_with_sla_flags`: unclassified is treated as **unresolved** — the conservative assumption. | warn |
+| Claim points to a `provider_id` that doesn't exist | `stg_claims` | dbt `relationships` test against `stg_providers.provider_id` (the full raw ID set — not `resolved_provider_id`, which only contains post-dedup identities) | Left join on raw `provider_id` keeps the claim, adds `provider_match_status = 'unmatched'` plus `resolved_provider_id = NULL`. Still tracked through `int_claims_enriched` into `fct_claims`. Never dropped — a broken provider link doesn't erase a real deadline. | warn |
+| Letter missing `classification_status` | `stg_carrier_letters` | `not_null` test | Coalesced to `'unclassified'` (never guessed). Business rule in `int_carrier_letters_with_sla_flags`: unclassified is treated as **unresolved** — the conservative assumption. | warn |
 | `response_due_date` before `received_date` | `stg_carrier_letters` | `dbt_expectations.expect_column_pair_values_A_to_be_greater_than_B` | Flagged `is_date_anomaly = true`, excluded from SLA breach calculation (can't compute a deadline breach off a broken deadline), but kept and surfaced on a data-quality mart page — never silently dropped. | error |
-| Duplicate provider (typo'd name, different ID) | `stg_providers` | No automated test — fuzzy duplicates are a modeling problem, not a null/type problem | Dedup macro: normalize whitespace/casing, group by `(normalized_name, state)`, pick earliest `provider_id` as canonical, emit a `provider_id_map` so future duplicates route to the canonical ID. The one case where staging rewrites a value, because it's resolving identity, not fixing data. | n/a (structural) |
+| Duplicate provider (typo'd name, different ID) | `stg_providers` | No automated test — fuzzy duplicates are a modeling problem, not a null/type problem | `WHERE provider_id = resolved_provider_id` filter (not a `GROUP BY`): `resolved_provider_id` is computed as `MIN(provider_id)` per `(normalized_name, state)` group, so the "winning" row is always the one row where the two columns are equal — filtering on that equality keeps exactly one row per real person. The one case where staging's output feeds a downstream dedup filter rather than just flagging a problem. | n/a (structural) |
+| Training record referencing a duplicate provider's raw ID | `stg_training_records` | `unique` test on `training_id` (fails via fan-out, not directly) | Joining on `resolved_provider_id` instead of raw `provider_id` caused one training record to match multiple provider rows in a duplicate group, duplicating the training record itself. Fixed by joining `source.provider_id = providers.provider_id` (unique 1:1) and only then reading `providers.resolved_provider_id` for later grouping. | n/a (join bug, not a data-quality flag) |
+
+**A downstream consequence worth tracking explicitly:** the 30 claims with `resolved_provider_id = NULL` will not appear in any `fct_claims` report that inner-joins to `dim_providers` for a provider-level breakdown — they'd simply be absent, with no visible indication anything is missing. `fct_claims` carries its own `has_provider_link` boolean (copied from `stg_claims.provider_match_status`) specifically so these 30 stay visible and filterable, rather than silently disappearing from provider-grouped views in Power BI.
 
 **Severity and the pipeline:** `error`-level test failures block the Airflow DAG from promoting that run — bad dates are a real defect worth stopping for. `warn`-level failures (orphaned provider, unclassified letter) let the pipeline continue but get logged visibly, since a single unmatched provider shouldn't block a whole day's claims from loading.
 
@@ -176,8 +189,8 @@ flowchart TD
 
 ## 9. Serving layer
 
-- **Power BI**: connects directly to the `marts` schema. Two report pages — claims/SLA overview, provider training compliance.
-- **Alerting**: a scheduled step (GitHub Actions cron, or a task inside the Airflow DAG) queries `fct_claims` / `fct_carrier_letters` for new breaches and posts to a Teams or Slack webhook. This is the piece that turns the project from "a dashboard" into "an automated business process" — worth calling out explicitly in your README and LinkedIn post.
+- **Power BI**: connects directly to the `marts` schema. Two report pages — claims/SLA overview (from `fct_claims` + `fct_carrier_letters`), provider training compliance (from `fct_provider_training`) — both joined to `dim_providers`/`dim_carriers` for names rather than raw IDs.
+- **Alerting**: a scheduled step (GitHub Actions cron, or a task inside the Airflow DAG) queries `fct_claims` / `fct_carrier_letters` / `fct_provider_training` for new breaches and posts to a Teams or Slack webhook. This is the piece that turns the project from "a dashboard" into "an automated business process" — worth calling out explicitly in your README and LinkedIn post.
 
 ## 10. Security and cost guardrails
 

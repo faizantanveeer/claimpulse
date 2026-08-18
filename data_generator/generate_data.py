@@ -13,6 +13,7 @@ tests -- clean synthetic data teaches nothing.
 """
 
 import csv
+import os
 import random
 import uuid
 from datetime import date, timedelta
@@ -24,7 +25,7 @@ fake = Faker()
 Faker.seed(42)
 random.seed(42)
 
-OUTPUT_DIR = Path(__file__).parent / "output"
+OUTPUT_DIR = Path(os.environ.get("CLAIMPULSE_DATA_DIR", Path(__file__).parent / "output"))
 LOAD_DATE = date.today()
 
 N_CARRIERS = 10
