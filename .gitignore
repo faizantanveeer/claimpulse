@@ -2,3 +2,4 @@
 output/*
 venv/
 logs/
+airflow/shared_data/*

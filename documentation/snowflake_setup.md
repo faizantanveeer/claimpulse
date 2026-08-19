@@ -93,6 +93,12 @@ CREATE STAGE IF NOT EXISTS claimpulse_raw_stage
 -- Sanity check once the stage exists: this lists what's actually sitting
 -- in the bucket, from Snowflake's side, without loading anything yet.
 -- LIST @claimpulse_raw_stage/source=batch/table=claims/;
+--
+-- carriers/providers are reference data uploaded under a single fixed key
+-- (table=carriers/carriers.csv, no year=/month=/day=/ split) instead of a
+-- new timestamped file every run -- COPY INTO's load history then skips
+-- them once loaded instead of re-ingesting the same 10/208 rows daily.
+-- LIST @claimpulse_raw_stage/source=batch/table=carriers/;
 
 -- ===================================================================
 -- 6. Raw tables -- one per source table, columns match the CSVs exactly.

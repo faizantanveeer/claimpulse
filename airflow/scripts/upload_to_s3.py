@@ -163,6 +163,51 @@ def process_table(table_name: str, local_dir: Path, source: str = "batch"):
         log.info("  no valid files found to upload")
 
 
+def process_reference_table(table_name: str, local_dir: Path, source: str = "batch"):
+    """Reference tables (carriers, providers) are generated once and reused --
+    the CSV here is unpartitioned and typically unchanged run over run. Upload
+    it under a fixed, non-timestamped key instead of process_table's unique
+    timestamp+hash filename: COPY INTO's load history dedups by file path, so
+    a stable key lets an unchanged file get correctly skipped on every
+    subsequent run instead of being re-ingested as "new" data every time.
+    """
+    log.info(f"Processing table: {table_name} (reference)")
+    now = datetime.now(timezone.utc)
+
+    csv_files = sorted(local_dir.glob("*.csv"))
+    if not csv_files:
+        log.info("  no valid files found to upload")
+        return
+    csv_file = csv_files[0]
+
+    if not validate_columns(csv_file, table_name):
+        quarantine_file(csv_file, table_name, now)
+        return
+
+    row_count = count_rows(csv_file)
+    checksum = md5_of_file(csv_file)
+    key = f"raw/source={source}/table={table_name}/{table_name}.csv"
+
+    upload_file_with_retry(csv_file, key)
+
+    manifest = {
+        "table": table_name,
+        "source": source,
+        "batch_uploaded_at": now.isoformat(),
+        "file_count": 1,
+        "total_rows": row_count,
+        "files": [{
+            "file": csv_file.name,
+            "s3_key": key,
+            "row_count": row_count,
+            "md5": checksum,
+            "uploaded_at": now.isoformat(),
+        }],
+    }
+    upload_manifest(source, table_name, now, manifest)
+    log.info(f"  done: 1 files, {row_count} rows (fixed key -- COPY INTO skips if unchanged)")
+
+
 def main():
     if not OUTPUT_DIR.exists():
         log.error(f"No output directory found at {OUTPUT_DIR}. Run generate_data.py first.")
@@ -172,9 +217,14 @@ def main():
         if not table_dir.is_dir():
             continue
         table_name = table_dir.name
-        # each table dir contains dt=YYYY-MM-DD subfolders from the generator
-        for dt_dir in sorted(table_dir.glob("dt=*")):
-            process_table(table_name, dt_dir)
+        dt_dirs = sorted(table_dir.glob("dt=*"))
+        if dt_dirs:
+            # event data: each table dir contains dt=YYYY-MM-DD subfolders
+            for dt_dir in dt_dirs:
+                process_table(table_name, dt_dir)
+        else:
+            # reference data: CSVs sit directly in the table dir, no date partition
+            process_reference_table(table_name, table_dir)
 
 
 if __name__ == "__main__":
